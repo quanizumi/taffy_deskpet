@@ -7,10 +7,12 @@ python -m PyInstaller --noconfirm --clean ^
   --onefile ^
   --windowed ^
   --name DeskPet ^
-  --add-data "assets\character.png;assets" ^
+  --add-data "assets\character_cutout.png;assets" ^
+  --add-data "assets\9月4日.mp3;assets" ^
   --hidden-import PySide6.QtCore ^
   --hidden-import PySide6.QtGui ^
   --hidden-import PySide6.QtWidgets ^
+  --hidden-import PySide6.QtMultimedia ^
   src\desk_pet.py
 
 if errorlevel 1 (

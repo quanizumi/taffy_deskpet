@@ -2,11 +2,11 @@
 
 
 a = Analysis(
-    ['src\\desk_pet.py'],
+    ['src/desk_pet.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets\\character.png', 'assets')],
-    hiddenimports=[],
+    datas=[('assets/character_cutout.png', 'assets'), ('assets/9月4日.mp3', 'assets')],
+    hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'PySide6.QtMultimedia'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
