@@ -937,12 +937,13 @@ class DeskPet(QWidget):
         self._mace_overlay.set_swing(swing)
 
     def _on_mace_hit(self, x: float, y: float) -> None:
-        """Turn a smile into the cry face, play the cry clip, and swap the bubble line."""
+        """Turn a smile into the cry face and play the cry clip. Every hit picks a new line."""
         self._start_hit_anim(x, y)
+        self._hit_line = self._pick_hit_line()
         if self._crying:
+            self.update()
             return
         self._crying = True
-        self._hit_line = self._pick_hit_line()
         self._stop_voice()
         self._play_cry()
         self.update()
@@ -1071,7 +1072,7 @@ class DeskPet(QWidget):
         auto_act.triggered.connect(self._toggle_autostart)
         menu.addAction(auto_act)
 
-        voice_act = QAction("关闭语音" if self._smile_voice_on else "开启语音", self)
+        voice_act = QAction("关闭语音" if self._voice_switch_on() else "开启语音", self)
         voice_act.triggered.connect(self._toggle_voice)
         menu.addAction(voice_act)
 
@@ -1273,7 +1274,7 @@ class DeskPet(QWidget):
         self._cry_player = QMediaPlayer(self)
         self._cry_player.setAudioOutput(self._cry_audio)
         self._cry_player.setSource(QUrl.fromLocalFile(str(cry_path)))
-        self._cry_player.setLoops(QMediaPlayer.Loops.Once)
+        self._cry_player.setLoops(QMediaPlayer.Loops.Infinite)
 
     def _play_voice(self) -> None:
         """Start the smile loop. Stays silent while the cry face is up."""
@@ -1289,18 +1290,28 @@ class DeskPet(QWidget):
         self._player.stop()
 
     def _play_cry(self) -> None:
-        """Play the cry clip once from the start."""
+        """Loop the cry clip from the start. It keeps going until the smile returns."""
         self._cry_player.stop()
         self._cry_player.setPosition(0)
         self._cry_player.play()
 
-    def _toggle_voice(self) -> None:
-        """Menu switch for the smile loop. A cry face keeps it silent until the smile returns."""
+    def _voice_switch_on(self) -> bool:
+        """True when a clip is playing or the user left voice on, so the menu can close it."""
         if self._smile_voice_on:
+            return True
+        return self._cry_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+
+    def _toggle_voice(self) -> None:
+        """Menu switch. Closes the smile loop or the cry loop, whichever is current."""
+        if self._voice_switch_on():
             self._smile_voice_on = False
             self._stop_voice()
+            self._cry_player.stop()
             return
         self._smile_voice_on = True
+        if self._crying:
+            self._play_cry()
+            return
         self._play_voice()
 
     def _on_click(self) -> None:
