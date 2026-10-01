@@ -227,7 +227,6 @@ class DeskPet(QWidget):
         self._init_voice()
         self._apply_size()
         self._center_on_screen()
-        QTimer.singleShot(0, self._play_voice)
         QTimer.singleShot(200, lambda: self._refresh_usage(True))
         self._usage_timer = QTimer(self)
         self._usage_timer.setInterval(60_000)
@@ -637,12 +636,10 @@ class DeskPet(QWidget):
         top_act.triggered.connect(self._toggle_topmost)
         menu.addAction(top_act)
 
-        stop_act = QAction("关闭音频", self)
-        stop_act.setEnabled(
-            self._player.playbackState() != QMediaPlayer.PlaybackState.StoppedState
-        )
-        stop_act.triggered.connect(self._stop_voice)
-        menu.addAction(stop_act)
+        voice_on = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        voice_act = QAction("关闭语音" if voice_on else "开启语音", self)
+        voice_act.triggered.connect(self._toggle_voice)
+        menu.addAction(voice_act)
 
         refresh_act = QAction("刷新额度", self)
         refresh_act.triggered.connect(lambda checked=False: self._refresh_usage(True))
@@ -699,19 +696,25 @@ class DeskPet(QWidget):
         self._player.setLoops(QMediaPlayer.Loops.Infinite)
 
     def _play_voice(self) -> None:
-        """Start looping audio; do not restart if it is already playing."""
+        """Start the looping laugh. Does nothing if it is already playing."""
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             return
         self._player.setPosition(0)
         self._player.play()
 
     def _stop_voice(self) -> None:
-        """Stop the click audio from the right-click menu."""
+        """Stop the looping laugh."""
         self._player.stop()
 
+    def _toggle_voice(self) -> None:
+        """Right-click voice switch. Startup stays silent until this is turned on."""
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._stop_voice()
+        else:
+            self._play_voice()
+
     def _on_click(self) -> None:
-        """Resume voice, swap the quote, and refresh usage unless one just started."""
-        self._play_voice()
+        """Swap the quote and refresh usage. Voice is only toggled from the menu."""
         if self._snapshot is not None and self._snapshot.missing_note:
             self._dismiss_note = True
         if self._snapshot is not None and self._level >= 0:
