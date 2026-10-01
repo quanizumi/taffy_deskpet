@@ -2,26 +2,33 @@
 
 from __future__ import annotations
 
+import ctypes
+import math
 import random
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QCursor,
     QFont,
     QFontMetrics,
     QGuiApplication,
     QIcon,
+    QImage,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
+    QTransform,
     QWheelEvent,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -84,6 +91,12 @@ _LINES: dict[int, tuple[str, ...]] = {
     ),
 }
 _TIER_LINES = {1: _LINES[2][0], 2: _LINES[3][1]}
+_HIT_LINES = (
+    "啊不要 塔菲知错了",
+    "对塔菲有菲分之想是吧",
+    "啊雏草姬 不要不要",
+)
+_SMILE_LINE = "嘻嘻嘻嘻嘻嘻嘻嘻嘻嘻嘻"
 
 _FONT_FAMILIES = (
     "Microsoft YaHei",
@@ -108,6 +121,20 @@ _INK = QColor("#5a3040")
 
 # Gap from the locked corner of the Cursor window, in physical pixels.
 _DEFAULT_MARGIN = 28
+# Cursor width before the tilt. Height follows the cutout.
+_MACE_CURSOR_W = 40
+# How long the strike squash and mace swing last.
+_HIT_ANIM_MS = 340
+# How long the white burst stays after a hit.
+_SPARK_MS = 480
+_SPARK_LENGTHS = (1.0, 0.72, 0.9, 0.55, 0.84, 0.68, 1.0, 0.6, 0.78, 0.5, 0.92, 0.7)
+# Degrees clockwise. Negative leans the head to the left, like a held club.
+_MACE_TILT_DEG = -32.0
+# System cursors replaced while the mace is out. Size cursors stay so edges still resize.
+_MACE_CURSOR_IDS = (32512, 32513, 32514, 32515, 32649, 32650)
+_SPI_SETCURSORS = 0x0057
+# Windows 11: cursors created after this are shown at their bitmap size.
+_CURSOR_CREATION_SCALING_NONE = 1
 
 
 class _UsageBridge(QObject):
@@ -131,6 +158,269 @@ class _Layout:
     u: float
 
 
+def _tilt_mace(
+    pixmap: QPixmap,
+    degrees: float,
+    hot_x: float,
+    hot_y: float,
+) -> tuple[QPixmap, int, int]:
+    """Rotate around the pixmap center. The hotspot stays on the spiked head."""
+    transform = QTransform()
+    center_x = pixmap.width() / 2
+    center_y = pixmap.height() / 2
+    transform.translate(center_x, center_y)
+    transform.rotate(degrees)
+    transform.translate(-center_x, -center_y)
+    tilted = pixmap.transformed(transform, Qt.TransformationMode.SmoothTransformation)
+    mapped = transform.map(QPointF(hot_x, hot_y))
+    bounds = transform.mapRect(QRectF(0, 0, pixmap.width(), pixmap.height()))
+    hx = int(round(mapped.x() - bounds.left()))
+    hy = int(round(mapped.y() - bounds.top()))
+    hx = min(max(hx, 0), max(0, tilted.width() - 1))
+    hy = min(max(hy, 0), max(0, tilted.height() - 1))
+    return tilted, hx, hy
+
+
+def _mace_cursor(pixmap: QPixmap) -> QCursor:
+    """Build the tilted mace pointer. The hotspot is the middle of the spiked head."""
+    target_h = max(1, round(pixmap.height() * _MACE_CURSOR_W / pixmap.width()))
+    scaled = pixmap.scaled(
+        _MACE_CURSOR_W,
+        target_h,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    hot_x = scaled.width() / 2
+    hot_y = scaled.height() * 0.28
+    tilted, hx, hy = _tilt_mace(scaled, _MACE_TILT_DEG, hot_x, hot_y)
+    return QCursor(tilted, hx, hy)
+
+
+def _cursor_lock_path() -> Path:
+    """Marker so a crash can put the system arrow back on the next launch."""
+    return Path(tempfile.gettempdir()) / "desk_pet_mace_cursor.lock"
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+
+class _ICONINFO(ctypes.Structure):
+    _fields_ = [
+        ("fIcon", wintypes.BOOL),
+        ("xHotspot", wintypes.DWORD),
+        ("yHotspot", wintypes.DWORD),
+        ("hbmMask", wintypes.HBITMAP),
+        ("hbmColor", wintypes.HBITMAP),
+    ]
+
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+_user32.GetDC.argtypes = [wintypes.HWND]
+_user32.GetDC.restype = wintypes.HDC
+_user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+_user32.ReleaseDC.restype = ctypes.c_int
+_user32.CreateIconIndirect.argtypes = [ctypes.POINTER(_ICONINFO)]
+_user32.CreateIconIndirect.restype = wintypes.HICON
+_user32.DestroyCursor.argtypes = [wintypes.HICON]
+_user32.DestroyCursor.restype = wintypes.BOOL
+_user32.SetSystemCursor.argtypes = [wintypes.HICON, wintypes.DWORD]
+_user32.SetSystemCursor.restype = wintypes.BOOL
+_user32.SystemParametersInfoW.argtypes = [
+    wintypes.UINT,
+    wintypes.UINT,
+    wintypes.LPVOID,
+    wintypes.UINT,
+]
+_user32.SystemParametersInfoW.restype = wintypes.BOOL
+_user32.SetThreadCursorCreationScaling.argtypes = [wintypes.UINT]
+_user32.SetThreadCursorCreationScaling.restype = wintypes.UINT
+_gdi32.CreateDIBSection.argtypes = [
+    wintypes.HDC,
+    ctypes.POINTER(_BITMAPINFO),
+    wintypes.UINT,
+    ctypes.POINTER(ctypes.c_void_p),
+    wintypes.HANDLE,
+    wintypes.DWORD,
+]
+_gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+_gdi32.CreateBitmap.argtypes = [
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.UINT,
+    wintypes.UINT,
+    ctypes.c_void_p,
+]
+_gdi32.CreateBitmap.restype = wintypes.HBITMAP
+_gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+_gdi32.DeleteObject.restype = wintypes.BOOL
+
+_system_mace_on = False
+
+
+def _hcursor_from_pixmap(pixmap: QPixmap, hot_x: int, hot_y: int):
+    """Color cursor with the pixmap's alpha. Caller owns the returned handle."""
+    image = pixmap.toImage().convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    width = image.width()
+    height = image.height()
+    info = _BITMAPINFO()
+    info.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+    info.bmiHeader.biWidth = width
+    info.bmiHeader.biHeight = -height
+    info.bmiHeader.biPlanes = 1
+    info.bmiHeader.biBitCount = 32
+    info.bmiHeader.biCompression = 0
+    hdc = _user32.GetDC(None)
+    bits = ctypes.c_void_p()
+    color = _gdi32.CreateDIBSection(hdc, ctypes.byref(info), 0, ctypes.byref(bits), None, 0)
+    if not color or not bits:
+        _user32.ReleaseDC(None, hdc)
+        raise OSError("创建狼牙棒光标失败")
+    row_bytes = width * 4
+    source = bytes(image.constBits())
+    stride = image.bytesPerLine()
+    for y in range(height):
+        ctypes.memmove(bits.value + y * row_bytes, source[y * stride : y * stride + row_bytes], row_bytes)
+    mask_row = ((width + 31) // 32) * 4
+    mask_bits = (ctypes.c_ubyte * (mask_row * height))(*([0xFF] * (mask_row * height)))
+    mask = _gdi32.CreateBitmap(width, height, 1, 1, ctypes.cast(mask_bits, ctypes.c_void_p))
+    icon = _ICONINFO()
+    icon.fIcon = False
+    icon.xHotspot = max(0, hot_x)
+    icon.yHotspot = max(0, hot_y)
+    icon.hbmMask = mask
+    icon.hbmColor = color
+    handle = _user32.CreateIconIndirect(ctypes.byref(icon))
+    _gdi32.DeleteObject(color)
+    _gdi32.DeleteObject(mask)
+    _user32.ReleaseDC(None, hdc)
+    if not handle:
+        raise OSError("创建狼牙棒光标失败")
+    return handle
+
+
+def _blank_cursor() -> QCursor:
+    """Invisible pointer. The mace itself is a window, so the real cursor stays hidden."""
+    pixmap = QPixmap(1, 1)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    return QCursor(pixmap, 0, 0)
+
+
+def _install_system_cursor(cursor: QCursor) -> None:
+    """Replace the system pointer with this cursor's bitmap, at that bitmap's pixel size."""
+    global _system_mace_on
+    pixmap = cursor.pixmap()
+    hot = cursor.hotSpot()
+    _cursor_lock_path().write_text("1", encoding="ascii")
+    previous_scaling = _user32.SetThreadCursorCreationScaling(_CURSOR_CREATION_SCALING_NONE)
+    try:
+        for cursor_id in _MACE_CURSOR_IDS:
+            handle = _hcursor_from_pixmap(pixmap, hot.x(), hot.y())
+            if not _user32.SetSystemCursor(handle, cursor_id):
+                _restore_system_cursor()
+                raise OSError("替换系统光标失败")
+    finally:
+        _user32.SetThreadCursorCreationScaling(previous_scaling)
+    _system_mace_on = True
+
+
+def _restore_system_cursor() -> None:
+    """Put back the cursor scheme. Safe to call when the mace was never shown."""
+    global _system_mace_on
+    if not _system_mace_on and not _cursor_lock_path().is_file():
+        return
+    _user32.SystemParametersInfoW(_SPI_SETCURSORS, 0, None, 0)
+    _system_mace_on = False
+    try:
+        _cursor_lock_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+class _MaceOverlay(QWidget):
+    """One mace image that follows the pointer, on the character and off it.
+
+    A system cursor and a Qt cursor are scaled by different rules, so the mace
+    changed size at the edge of the pet. This window is the only picture, and
+    mouse clicks pass through it to whatever is underneath.
+    """
+
+    def __init__(self, cursor: QCursor, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._pixmap = cursor.pixmap()
+        self._hot = cursor.hotSpot()
+        # Extra room so the swing is not clipped by the window edge.
+        self._pad = max(self._pixmap.width(), self._pixmap.height()) // 2
+        self._swing = 0.0
+        self.resize(self._pixmap.width() + self._pad * 2, self._pixmap.height() + self._pad * 2)
+        self.hide()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        """Draw the tilted mace. A strike rotates it around the spiked head."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        hot_x = self._hot.x() + self._pad
+        hot_y = self._hot.y() + self._pad
+        painter.translate(hot_x, hot_y)
+        painter.rotate(self._swing)
+        painter.translate(-hot_x, -hot_y)
+        painter.drawPixmap(self._pad, self._pad, self._pixmap)
+        painter.end()
+
+    def set_swing(self, degrees: float) -> None:
+        """Rotate around the head. Zero is the resting tilt."""
+        if degrees == 0.0:
+            if self._swing == 0.0:
+                return
+        elif abs(degrees - self._swing) < 0.2:
+            return
+        self._swing = degrees
+        if self.isVisible():
+            self.update()
+
+    def follow(self) -> None:
+        """Put the spiked head on the real pointer."""
+        pos = QCursor.pos()
+        x = pos.x() - (self._hot.x() + self._pad)
+        y = pos.y() - (self._hot.y() + self._pad)
+        if self.x() != x or self.y() != y:
+            self.move(x, y)
+
+    def show_at_pointer(self) -> None:
+        """Show the mace where the pointer already is."""
+        self.follow()
+        self.show()
+        self.raise_()
+
+
 def _format_percent(value: float) -> str:
     """Whole percent, the same rounding as Cursor's usage page."""
     return f"{displayed_percent(value)}%"
@@ -148,6 +438,19 @@ class DeskPet(QWidget):
         self._pixmap_src = QPixmap(str(asset))
         if self._pixmap_src.isNull():
             raise FileNotFoundError(f"找不到角色图片: {asset}")
+        cry = resource_path("assets/character_cry.png")
+        self._pixmap_cry = QPixmap(str(cry))
+        if self._pixmap_cry.isNull():
+            raise FileNotFoundError(f"找不到哭脸图片: {cry}")
+        mace = resource_path("assets/mace_cutout.png")
+        mace_pixmap = QPixmap(str(mace))
+        if mace_pixmap.isNull():
+            raise FileNotFoundError(f"找不到狼牙棒图片: {mace}")
+        self._mace_cursor = _mace_cursor(mace_pixmap)
+        self._blank_cursor = _blank_cursor()
+        self._mace_overlay = _MaceOverlay(self._mace_cursor, self)
+        self._mace_armed = False
+        self._crying = False
 
         self._scale = 0.22
         self._min_scale = 0.10
@@ -175,10 +478,17 @@ class DeskPet(QWidget):
         self._tier = 0
         self._sticky = False
         self._line = "塔菲在看额度…"
+        self._hit_line: str | None = None
         self._quote_override: str | None = None
         self._dismiss_note = False
         self._squash = 1.0
         self._squash_target = 1.0
+        self._hit_started = 0.0
+        self._hit_squash = 1.0
+        self._hit_dx = 0.0
+        self._spark_started = 0.0
+        self._spark_xy: tuple[float, float] | None = None
+        self._spark_spin = 0.0
         self._pulse = 0.0
         self._roll: dict[str, float | None] = {
             "auto": None,
@@ -224,8 +534,18 @@ class DeskPet(QWidget):
             self._pulse *= 0.9
             if self._pulse < 0.02:
                 self._pulse = 0.0
+        self._advance_hit_anim()
+        self._advance_sparks()
+        if self._mace_armed:
+            self._mace_overlay.follow()
         if self.isVisible():
             self.update()
+
+    def _sprite(self) -> QPixmap:
+        """Cry face stays up until the menu switches back to the smile."""
+        if self._crying:
+            return self._pixmap_cry
+        return self._pixmap_src
 
     def _scaled_size(self) -> tuple[int, int]:
         w = max(40, int(self._pixmap_src.width() * self._scale))
@@ -264,6 +584,8 @@ class DeskPet(QWidget):
             self._line,
         ]
         samples.extend(line for pool in _LINES.values() for line in pool)
+        samples.extend(_HIT_LINES)
+        samples.append(_SMILE_LINE)
         if self._quote_override:
             samples.append(self._quote_override)
         if self._snapshot and self._snapshot.missing_note:
@@ -326,6 +648,7 @@ class DeskPet(QWidget):
         if layout.bubble is not None:
             self._paint_bubble(painter, layout)
         self._paint_sprite(painter, layout)
+        self._paint_sparks(painter, layout)
         if self._level >= 2:
             self._paint_sweat(painter, layout)
         painter.end()
@@ -333,14 +656,75 @@ class DeskPet(QWidget):
     def _paint_sprite(self, painter: QPainter, layout: _Layout) -> None:
         """Draw the cutout. Squash keeps the sprite's bottom edge where it was."""
         bottom = layout.sprite_y + layout.sprite_h
-        draw_h = max(1, int(round(layout.sprite_h * self._squash)))
+        if self._hit_started > 0:
+            squash = self._hit_squash
+            draw_w = max(1, int(round(layout.sprite_w * (1 + (1 - squash) * 0.45))))
+            origin_x = layout.sprite_x + self._hit_dx + (layout.sprite_w - draw_w) / 2
+        else:
+            squash = self._squash
+            draw_w = layout.sprite_w
+            origin_x = layout.sprite_x
+        draw_h = max(1, int(round(layout.sprite_h * squash)))
         painter.drawPixmap(
-            int(round(layout.sprite_x)),
+            int(round(origin_x)),
             int(round(bottom - draw_h)),
-            layout.sprite_w,
+            draw_w,
             draw_h,
-            self._pixmap_src,
+            self._sprite(),
         )
+
+    def _paint_sparks(self, painter: QPainter, layout: _Layout) -> None:
+        """White firework at the spot the mace landed. Rays shoot out, then fade."""
+        if self._spark_started <= 0 or self._spark_xy is None:
+            return
+        progress = (time.monotonic() - self._spark_started) / (_SPARK_MS / 1000)
+        if progress >= 1:
+            return
+        travel = min(progress / 0.42, 1.0)
+        alpha = int(230 * (1 - progress) ** 0.55)
+        if alpha <= 0:
+            return
+        cx, cy = self._spark_xy
+        reach = max(16.0, layout.sprite_w * 0.28) * (0.2 + 0.8 * travel)
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        glow = int(alpha * 0.45)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, glow))
+        glow_r = reach * 0.28
+        painter.drawEllipse(QPointF(cx, cy), glow_r, glow_r)
+        pen_w = max(1.6, 2.4 * layout.u)
+        painter.setPen(QPen(QColor(255, 255, 255, alpha), pen_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        tip_r = max(1.6, 2.2 * layout.u)
+        count = len(_SPARK_LENGTHS)
+        for index, length in enumerate(_SPARK_LENGTHS):
+            angle = self._spark_spin + index * math.tau / count
+            outer = reach * length
+            inner = outer * 0.42
+            tip_x = cx + math.cos(angle) * outer
+            tip_y = cy + math.sin(angle) * outer
+            painter.drawLine(
+                QPointF(cx + math.cos(angle) * inner, cy + math.sin(angle) * inner),
+                QPointF(tip_x, tip_y),
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, alpha))
+            painter.drawEllipse(QPointF(tip_x, tip_y), tip_r, tip_r)
+            painter.setPen(QPen(QColor(255, 255, 255, alpha), pen_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            tick = tip_r * 2.4
+            painter.drawLine(QPointF(tip_x - tick, tip_y), QPointF(tip_x + tick, tip_y))
+            painter.drawLine(QPointF(tip_x, tip_y - tick), QPointF(tip_x, tip_y + tick))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.restore()
+
+    def _advance_sparks(self) -> None:
+        """Drop the firework once it has faded."""
+        if self._spark_started <= 0:
+            return
+        if (time.monotonic() - self._spark_started) >= _SPARK_MS / 1000:
+            self._spark_started = 0.0
+            self._spark_xy = None
 
     def _paint_bubble(self, painter: QPainter, layout: _Layout) -> None:
         """Speech bubble above the head: two usage pools, then one line."""
@@ -444,12 +828,16 @@ class DeskPet(QWidget):
         return f"Cursor {auto_text} · 其他 {api_text}"
 
     def _quote(self) -> str:
-        """Line under the bars. A missing-field note wins until the pet is clicked."""
+        """Smile shows one line. A hit line stays until the smile comes back."""
+        if self._crying and self._hit_line:
+            return self._hit_line
         if self._quote_override:
             return self._quote_override
         snap = self._snapshot
         if snap and snap.missing_note and not self._dismiss_note:
             return snap.missing_note
+        if not self._crying:
+            return _SMILE_LINE
         return self._line
 
     def _paint_meter(
@@ -506,7 +894,98 @@ class DeskPet(QWidget):
         painter.setBrush(QColor(130, 200, 255, 210))
         painter.drawPath(path)
 
+    def _sprite_contains(self, pos) -> bool:
+        """True when a widget-local point lands on the character, not the bubble."""
+        layout = self._compute_layout()
+        rect = QRectF(layout.sprite_x, layout.sprite_y, layout.sprite_w, layout.sprite_h)
+        return rect.contains(pos)
+
+    def _pick_hit_line(self) -> str:
+        """One hit line, skipping the line already in the bubble."""
+        choices = [line for line in _HIT_LINES if line != self._hit_line]
+        return random.choice(choices or _HIT_LINES)
+
+    def _start_hit_anim(self, x: float, y: float) -> None:
+        """Play the strike and a white burst at the point that was hit."""
+        now = time.monotonic()
+        self._hit_started = now
+        self._spark_started = now
+        self._spark_xy = (x, y)
+        self._spark_spin = random.random() * math.tau
+        self._advance_hit_anim()
+
+    def _advance_hit_anim(self) -> None:
+        """Step the strike. Does nothing once the swing has finished."""
+        if self._hit_started <= 0:
+            return
+        progress = (time.monotonic() - self._hit_started) / (_HIT_ANIM_MS / 1000)
+        if progress >= 1:
+            self._hit_started = 0.0
+            self._hit_squash = 1.0
+            self._hit_dx = 0.0
+            self._mace_overlay.set_swing(0)
+            return
+        # The chop lands early, then the pose eases back.
+        if progress < 0.28:
+            impact = progress / 0.28
+            swing = -46 * math.sin(impact * math.pi / 2)
+        else:
+            impact = 1 - (progress - 0.28) / 0.72
+            swing = -46 * impact
+        self._hit_squash = 1.0 - 0.26 * impact
+        self._hit_dx = math.sin(progress * math.pi * 3) * 12 * (1 - progress)
+        self._mace_overlay.set_swing(swing)
+
+    def _on_mace_hit(self, x: float, y: float) -> None:
+        """Turn a smile into the cry face, play the cry clip, and swap the bubble line."""
+        self._start_hit_anim(x, y)
+        if self._crying:
+            return
+        self._crying = True
+        self._hit_line = self._pick_hit_line()
+        self._stop_voice()
+        self._play_cry()
+        self.update()
+
+    def _restore_smile(self) -> None:
+        """Menu action: leave the cry face. The smile voice resumes only if it was left on."""
+        if not self._crying:
+            return
+        self._crying = False
+        self._hit_line = None
+        self._cry_player.stop()
+        self._squash_target = 1.0
+        if self._smile_voice_on:
+            self._play_voice()
+        self.update()
+
+    def _toggle_mace(self) -> None:
+        """Show one mace on the pointer everywhere, or put the normal pointer back."""
+        self._mace_armed = not self._mace_armed
+        if self._mace_armed:
+            QApplication.setOverrideCursor(self._blank_cursor)
+            try:
+                _install_system_cursor(self._blank_cursor)
+            except OSError:
+                QApplication.restoreOverrideCursor()
+                self._mace_armed = False
+                _restore_system_cursor()
+            else:
+                self._mace_overlay.show_at_pointer()
+            return
+        self._mace_overlay.hide()
+        self._mace_overlay.set_swing(0)
+        self._hit_started = 0.0
+        QApplication.restoreOverrideCursor()
+        _restore_system_cursor()
+        self._squash_target = 1.0
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._mace_armed:
+            if self._sprite_contains(event.position()):
+                self._on_mace_hit(event.position().x(), event.position().y())
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._squash_target = 0.9
             self._dragging = True
@@ -519,6 +998,9 @@ class DeskPet(QWidget):
             event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._mace_armed:
+            event.accept()
+            return
         if self._dragging and event.buttons() & Qt.MouseButton.LeftButton:
             pos = event.globalPosition().toPoint()
             if (pos - self._press_pos).manhattanLength() > self._click_threshold:
@@ -527,6 +1009,9 @@ class DeskPet(QWidget):
             event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._mace_armed:
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._squash_target = 1.0
             was_drag = self._moved
@@ -566,6 +1051,15 @@ class DeskPet(QWidget):
             act.triggered.connect(lambda checked=False, s=scale: self._set_scale(s))
             size_menu.addAction(act)
 
+        mace_act = QAction("收起狼牙棒" if self._mace_armed else "拿出狼牙棒", self)
+        mace_act.triggered.connect(self._toggle_mace)
+        menu.addAction(mace_act)
+
+        if self._crying:
+            smile_act = QAction("变回笑脸", self)
+            smile_act.triggered.connect(self._restore_smile)
+            menu.addAction(smile_act)
+
         if self._follow_cursor:
             follow_act = QAction("脱离 Cursor，全局置顶", self)
         else:
@@ -577,8 +1071,7 @@ class DeskPet(QWidget):
         auto_act.triggered.connect(self._toggle_autostart)
         menu.addAction(auto_act)
 
-        voice_on = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        voice_act = QAction("关闭语音" if voice_on else "开启语音", self)
+        voice_act = QAction("关闭语音" if self._smile_voice_on else "开启语音", self)
         voice_act.triggered.connect(self._toggle_voice)
         menu.addAction(voice_act)
 
@@ -632,6 +1125,8 @@ class DeskPet(QWidget):
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        if getattr(self, "_mace_armed", False):
+            self._mace_overlay.show_at_pointer()
 
     def _toggle_follow(self) -> None:
         """Switch between sticking to Cursor and the old always-on-top desktop mode."""
@@ -761,33 +1256,52 @@ class DeskPet(QWidget):
         self._anchor_my = max(0, my)
 
     def _init_voice(self) -> None:
-        """Load the mp3 and loop it for the lifetime of the pet."""
-        audio_path = resource_path("assets/9月4日.mp3")
-        if not audio_path.is_file():
-            raise FileNotFoundError(f"找不到音频: {audio_path}")
+        """Load the smile loop and the one-shot cry clip. Neither plays until asked."""
+        smile_path = resource_path("assets/9月4日.mp3")
+        cry_path = resource_path("assets/10月1日.mp3")
+        if not smile_path.is_file():
+            raise FileNotFoundError(f"找不到音频: {smile_path}")
+        if not cry_path.is_file():
+            raise FileNotFoundError(f"找不到音频: {cry_path}")
+        self._smile_voice_on = False
         self._audio_output = QAudioOutput(self)
         self._player = QMediaPlayer(self)
         self._player.setAudioOutput(self._audio_output)
-        self._player.setSource(QUrl.fromLocalFile(str(audio_path)))
+        self._player.setSource(QUrl.fromLocalFile(str(smile_path)))
         self._player.setLoops(QMediaPlayer.Loops.Infinite)
+        self._cry_audio = QAudioOutput(self)
+        self._cry_player = QMediaPlayer(self)
+        self._cry_player.setAudioOutput(self._cry_audio)
+        self._cry_player.setSource(QUrl.fromLocalFile(str(cry_path)))
+        self._cry_player.setLoops(QMediaPlayer.Loops.Once)
 
     def _play_voice(self) -> None:
-        """Start the looping laugh. Does nothing if it is already playing."""
+        """Start the smile loop. Stays silent while the cry face is up."""
+        if self._crying:
+            return
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             return
         self._player.setPosition(0)
         self._player.play()
 
     def _stop_voice(self) -> None:
-        """Stop the looping laugh."""
+        """Stop the smile loop without forgetting that the user left it on."""
         self._player.stop()
 
+    def _play_cry(self) -> None:
+        """Play the cry clip once from the start."""
+        self._cry_player.stop()
+        self._cry_player.setPosition(0)
+        self._cry_player.play()
+
     def _toggle_voice(self) -> None:
-        """Right-click voice switch. Startup stays silent until this is turned on."""
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+        """Menu switch for the smile loop. A cry face keeps it silent until the smile returns."""
+        if self._smile_voice_on:
+            self._smile_voice_on = False
             self._stop_voice()
-        else:
-            self._play_voice()
+            return
+        self._smile_voice_on = True
+        self._play_voice()
 
     def _on_click(self) -> None:
         """Swap the quote and refresh usage. Voice is only toggled from the menu."""
@@ -884,8 +1398,10 @@ def main() -> None:
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
+    _restore_system_cursor()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    app.aboutToQuit.connect(_restore_system_cursor)
     pet = DeskPet()
     pet._sync_host()
     sys.exit(app.exec())
