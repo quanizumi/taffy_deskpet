@@ -1,9 +1,9 @@
-"""Windows desktop pet — transparent, always-on-top, interactive."""
+"""Windows desktop pet that follows the Cursor window."""
 
 from __future__ import annotations
 
-import math
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -17,6 +17,7 @@ from PySide6.QtGui import (
     QFont,
     QFontMetrics,
     QGuiApplication,
+    QIcon,
     QPainter,
     QPainterPath,
     QPen,
@@ -27,17 +28,25 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
     QMenu,
+    QSystemTrayIcon,
     QWidget,
 )
 
+from cursor_host import (
+    find_cursor_host,
+    login_autostart_enabled,
+    place_above,
+    set_login_autostart,
+    window_rect,
+)
 from cursor_usage import (
     CursorUsageClient,
     FetchResult,
     QuotaSnapshot,
     alert_percent,
     alert_tier,
+    displayed_percent,
     mood_level,
-    plan_used_percent,
 )
 
 
@@ -49,25 +58,6 @@ def resource_path(relative: str) -> Path:
         base = Path(__file__).resolve().parent.parent
     return base / relative
 
-
-# Vertical offsets sampled from GIF.gif (10fps, no interpolation).
-JITTER_DY = (
-    0, -15, -3, -15, -7, -15, -7, -3, -7, -11, -7, -3, -15, -7, -11, -12,
-    -3, -7, -3, -15, -15, -11, -12, -3, -12, 0, -12, 0, -11, 0, -11, -12,
-    -11, -12, -11, -12, -3, -12, 0, -15, 0, -11, -7, -11, -12, -3, -12, 0,
-    -15, 0, -11, -7, -11, -12, -3, -12, 0, -11, 0, -11, -12, -11, -12, 0,
-    -12, 0, -15, 0, -11, -7, -11, -12, -3, -12, -3, -15, 0, -11, -7, -11,
-    -7, -3, -12, -3, -15, 0, -11, -7, -11, -7, -3, -7, -3, -15, -3, -12,
-    -3, -15, -7, -3, -7, -3, -15, -3, -15, -7, -15, -7, -3, -7, -3, -15,
-    -3, -12, -3, -15, 0, -15, -7, -11, -7, -11, -12, -3, -12, 0, -15, -7,
-    -11, -7, -11, 0, -3, -12, 0, -12, 0, -11, 0, -11, -12, -11, -7, -11,
-    -12, -15, -12, 0, -11, 0, -11, -7, -11, -12, -3, -7,
-)
-JITTER_FRAME_MS = 100
-
-# Speed and amplitude multipliers for calm / uneasy / alarm / panic.
-_MOOD_SPEED = (1, 2, 2, 3)
-_MOOD_AMP = (1.0, 1.0, 1.8, 2.6)
 
 _LINES: dict[int, tuple[str, ...]] = {
     0: (
@@ -116,6 +106,9 @@ _AUTO_COLOR = QColor("#f48cba")
 _API_COLOR = QColor("#e0b040")
 _INK = QColor("#5a3040")
 
+# Gap from the locked corner of the Cursor window, in physical pixels.
+_DEFAULT_MARGIN = 28
+
 
 class _UsageBridge(QObject):
     """Deliver a background usage result onto the widget thread."""
@@ -138,44 +131,17 @@ class _Layout:
     u: float
 
 
-def _format_dollars(value: float) -> str:
-    """Format a rolled dollar amount. Two decimals, matching cents / 100."""
-    return f"${value:.2f}"
-
-
 def _format_percent(value: float) -> str:
-    """One decimal, or a whole number when the value is already on an integer."""
-    nearest = int(value + 0.5) if value >= 0 else int(value - 0.5)
-    if abs(value - nearest) < 0.05:
-        return f"{nearest}%"
-    return f"{value:.1f}%"
-
-
-def _format_plan_percent(value: float) -> str:
-    """Half-up whole percent, so 36.5 shows as 37 like Cursor's own headline."""
-    if value < 0:
-        return f"{int(value - 0.5)}%"
-    return f"{int(value + 0.5)}%"
-
-
-def _money_from_cents(cents: int) -> str:
-    """Exact dollar text from integer cents. Does not round through float."""
-    sign = "-" if cents < 0 else ""
-    cents = abs(cents)
-    return f"{sign}${cents // 100}.{cents % 100:02d}"
+    """Whole percent, the same rounding as Cursor's usage page."""
+    return f"{displayed_percent(value)}%"
 
 
 class DeskPet(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("桌宠")
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self._follow_cursor = True
+        self._apply_window_flags()
         self.setMouseTracking(True)
 
         asset = resource_path("assets/character_cutout.png")
@@ -186,7 +152,11 @@ class DeskPet(QWidget):
         self._scale = 0.22
         self._min_scale = 0.10
         self._max_scale = 0.85
-        self._always_on_top = True
+        # Corner the pet sticks to, and the gap from that corner.
+        self._anchor_corner = "br"
+        self._anchor_mx = _DEFAULT_MARGIN
+        self._anchor_my = _DEFAULT_MARGIN
+        self._host = 0
 
         self._drag_offset = QPoint()
         self._dragging = False
@@ -194,7 +164,6 @@ class DeskPet(QWidget):
         self._moved = False
         self._click_threshold = 6
 
-        self._idle_ms = 0
         self._idle_timer = QTimer(self)
         self._idle_timer.setInterval(16)
         self._idle_timer.timeout.connect(self._on_idle_tick)
@@ -212,10 +181,8 @@ class DeskPet(QWidget):
         self._squash_target = 1.0
         self._pulse = 0.0
         self._roll: dict[str, float | None] = {
-            "remain": None,
             "auto": None,
             "api": None,
-            "plan": None,
         }
         self._roll_target: dict[str, float | None] = dict(self._roll)
         self._fetching = False
@@ -226,7 +193,13 @@ class DeskPet(QWidget):
 
         self._init_voice()
         self._apply_size()
-        self._center_on_screen()
+        if not self._follow_cursor:
+            self._center_on_screen()
+        self._init_tray()
+        self._host_timer = QTimer(self)
+        self._host_timer.setInterval(50)
+        self._host_timer.timeout.connect(self._sync_host)
+        self._host_timer.start()
         QTimer.singleShot(200, lambda: self._refresh_usage(True))
         self._usage_timer = QTimer(self)
         self._usage_timer.setInterval(60_000)
@@ -234,8 +207,7 @@ class DeskPet(QWidget):
         self._usage_timer.start()
 
     def _on_idle_tick(self) -> None:
-        """Advance the laugh loop, the squash, the rolling numbers, and the pop."""
-        self._idle_ms += 16
+        """Ease the press squash, the usage numbers, and the bubble pop."""
         self._squash += (self._squash_target - self._squash) * 0.35
         if abs(self._squash - self._squash_target) < 0.004:
             self._squash = self._squash_target
@@ -252,7 +224,8 @@ class DeskPet(QWidget):
             self._pulse *= 0.9
             if self._pulse < 0.02:
                 self._pulse = 0.0
-        self.update()
+        if self.isVisible():
+            self.update()
 
     def _scaled_size(self) -> tuple[int, int]:
         w = max(40, int(self._pixmap_src.width() * self._scale))
@@ -285,8 +258,7 @@ class DeskPet(QWidget):
         pad = max(8, int(10 * u))
         gap = max(2, int(3 * u))
         samples = [
-            "还剩 $8888.88",
-            "套餐已用 100% · $8888.88 / $8888.88",
+            "Cursor 100% · 其他 100%",
             "登录过期了，重新打开一下 Cursor",
             "塔菲看走眼了，待会再看",
             self._line,
@@ -297,10 +269,10 @@ class DeskPet(QWidget):
         if self._snapshot and self._snapshot.missing_note:
             samples.append(self._snapshot.missing_note)
         text_w = max(body_fm.horizontalAdvance(s) for s in samples if s)
-        text_w = max(text_w, QFontMetrics(title).horizontalAdvance("还剩 $8888.88"))
+        text_w = max(text_w, QFontMetrics(title).horizontalAdvance("Cursor 100% · 其他 100%"))
         bw = max(text_w + pad * 2, int(sw * 0.92))
         bar_h = max(body_h, max(6, int(8 * u)))
-        bh = pad * 2 + title_h + body_h + bar_h * 2 + body_h + gap * 4
+        bh = pad * 2 + title_h + bar_h * 2 + body_h + gap * 3
         tail = max(8, int(12 * u))
         top_slack = max(12, int(22 * u))
         side = max(6, int(8 * u))
@@ -345,49 +317,35 @@ class DeskPet(QWidget):
             geo.bottom() - self.height() - 40,
         )
 
-    def _jitter(self, sprite_h: int) -> tuple[float, float]:
-        """Laugh offset. Higher moods step through the GIF frames faster and farther."""
-        level = self._level if self._level >= 0 else 0
-        speed = _MOOD_SPEED[level]
-        amp = _MOOD_AMP[level]
-        idx = (self._idle_ms * speed // JITTER_FRAME_MS) % len(JITTER_DY)
-        oy = JITTER_DY[idx] * (sprite_h / 700.0) * amp
-        ox = 0.0
-        if level >= 3:
-            ox = (6.0 if (self._idle_ms // 45) % 2 == 0 else -6.0) * (sprite_h / 700.0)
-        return ox, oy
-
     def paintEvent(self, _event) -> None:  # noqa: N802
-        """Draw the quota bubble, then the cutout with the GIF's laugh jitter."""
+        """Draw the quota bubble, then the still cutout."""
         layout = self._compute_layout()
-        ox, oy = self._jitter(layout.sprite_h)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         if layout.bubble is not None:
-            self._paint_bubble(painter, layout, ox, oy)
-        self._paint_sprite(painter, layout, ox, oy)
+            self._paint_bubble(painter, layout)
+        self._paint_sprite(painter, layout)
         if self._level >= 2:
-            self._paint_sweat(painter, layout, ox, oy)
+            self._paint_sweat(painter, layout)
         painter.end()
 
-    def _paint_sprite(self, painter: QPainter, layout: _Layout, ox: float, oy: float) -> None:
+    def _paint_sprite(self, painter: QPainter, layout: _Layout) -> None:
         """Draw the cutout. Squash keeps the sprite's bottom edge where it was."""
-        top = layout.sprite_y + oy
-        bottom = top + layout.sprite_h
+        bottom = layout.sprite_y + layout.sprite_h
         draw_h = max(1, int(round(layout.sprite_h * self._squash)))
         painter.drawPixmap(
-            int(round(layout.sprite_x + ox)),
+            int(round(layout.sprite_x)),
             int(round(bottom - draw_h)),
             layout.sprite_w,
             draw_h,
             self._pixmap_src,
         )
 
-    def _paint_bubble(self, painter: QPainter, layout: _Layout, ox: float, oy: float) -> None:
-        """Speech bubble above the head: remaining dollars, two bars, one line."""
+    def _paint_bubble(self, painter: QPainter, layout: _Layout) -> None:
+        """Speech bubble above the head: two usage pools, then one line."""
         assert layout.bubble is not None
-        rect = layout.bubble.translated(ox, oy)
+        rect = layout.bubble
         if rect.top() < 2:
             rect.moveTop(2)
         level = self._level if self._level >= 0 else 0
@@ -452,29 +410,16 @@ class DeskPet(QWidget):
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._quote())
             return
 
-        remain = self._roll["remain"]
-        title = "还剩 —" if remain is None else "还剩 " + _format_dollars(remain)
+        title = self._usage_title()
         painter.setFont(title_font)
         painter.setPen(_INK)
         painter.drawText(QRectF(inner.left(), y, inner.width(), title_h), Qt.AlignmentFlag.AlignCenter, title)
         y += title_h + gap
 
-        painter.setFont(body_font)
-        painter.setPen(_INK)
-        subtitle = QFontMetrics(body_font).elidedText(
-            self._subtitle(), Qt.TextElideMode.ElideRight, int(inner.width())
-        )
-        painter.drawText(
-            QRectF(inner.left(), y, inner.width(), body_h),
-            Qt.AlignmentFlag.AlignCenter,
-            subtitle,
-        )
-        y += body_h + gap
-
         bar_h = max(body_h, max(6, int(8 * u)))
-        self._paint_meter(painter, inner.left(), y, inner.width(), bar_h, "Auto", self._roll["auto"], _AUTO_COLOR, body_font)
+        self._paint_meter(painter, inner.left(), y, inner.width(), bar_h, "Cursor", self._roll["auto"], _AUTO_COLOR, body_font)
         y += bar_h + gap
-        self._paint_meter(painter, inner.left(), y, inner.width(), bar_h, "API", self._roll["api"], _API_COLOR, body_font)
+        self._paint_meter(painter, inner.left(), y, inner.width(), bar_h, "其他", self._roll["api"], _API_COLOR, body_font)
         y += bar_h + gap
 
         quote = self._quote()
@@ -484,13 +429,19 @@ class DeskPet(QWidget):
         painter.drawText(QRectF(inner.left(), y, inner.width(), body_h), Qt.AlignmentFlag.AlignCenter, elided)
 
     def _is_sparse(self) -> bool:
-        """True when this reading has neither dollars nor either usage percent."""
+        """True when neither usage-page pool came back."""
         snap = self._snapshot
         if snap is None:
             return True
-        if snap.remaining_cents is not None or snap.auto_percent is not None or snap.api_percent is not None:
-            return False
-        return plan_used_percent(snap) is None
+        return snap.auto_percent is None and snap.api_percent is None
+
+    def _usage_title(self) -> str:
+        """Headline matching the usage page: Cursor Models, then Other Models."""
+        auto = self._roll["auto"]
+        api = self._roll["api"]
+        auto_text = "—" if auto is None else _format_percent(auto)
+        api_text = "—" if api is None else _format_percent(api)
+        return f"Cursor {auto_text} · 其他 {api_text}"
 
     def _quote(self) -> str:
         """Line under the bars. A missing-field note wins until the pet is clicked."""
@@ -500,27 +451,6 @@ class DeskPet(QWidget):
         if snap and snap.missing_note and not self._dismiss_note:
             return snap.missing_note
         return self._line
-
-    def _subtitle(self) -> str:
-        """Included-plan dollars only. Does not invent a ratio when limit is missing."""
-        snap = self._snapshot
-        if snap is None:
-            return ""
-        plan = self._roll["plan"]
-        if (
-            plan is None
-            or snap.included_spend_cents is None
-            or snap.limit_cents is None
-        ):
-            return ""
-        return (
-            "套餐已用 "
-            + _format_plan_percent(plan)
-            + " · "
-            + _money_from_cents(snap.included_spend_cents)
-            + " / "
-            + _money_from_cents(snap.limit_cents)
-        )
 
     def _paint_meter(
         self,
@@ -537,9 +467,9 @@ class DeskPet(QWidget):
         """One labeled bar. percent None draws an empty track and a dash, not zero."""
         painter.setFont(font)
         fm = QFontMetrics(font)
-        label_w = fm.horizontalAdvance("Auto") + 6
+        label_w = max(fm.horizontalAdvance("Cursor"), fm.horizontalAdvance("其他")) + 6
         value = "—" if percent is None else _format_percent(percent)
-        value_w = fm.horizontalAdvance("100.0%") + 4
+        value_w = fm.horizontalAdvance("100%") + 4
         painter.setPen(_INK)
         painter.drawText(QRectF(x, y, label_w, height), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
         track_x = x + label_w
@@ -562,11 +492,10 @@ class DeskPet(QWidget):
             value,
         )
 
-    def _paint_sweat(self, painter: QPainter, layout: _Layout, ox: float, oy: float) -> None:
-        """A drop on the hair when the quota is in the alarm or panic band."""
-        bob = math.sin(self._idle_ms / 180.0) * (3.0 * layout.u)
-        cx = layout.sprite_x + layout.sprite_w * 0.78 + ox
-        cy = layout.sprite_y + layout.sprite_h * 0.30 + oy + bob
+    def _paint_sweat(self, painter: QPainter, layout: _Layout) -> None:
+        """A still drop on the hair when the quota is in the alarm or panic band."""
+        cx = layout.sprite_x + layout.sprite_w * 0.78
+        cy = layout.sprite_y + layout.sprite_h * 0.30
         rx = max(3.0, 5.0 * layout.u)
         ry = max(4.0, 7.0 * layout.u)
         path = QPainterPath()
@@ -602,7 +531,9 @@ class DeskPet(QWidget):
             self._squash_target = 1.0
             was_drag = self._moved
             self._dragging = False
-            if not was_drag:
+            if was_drag and self._follow_cursor:
+                self._capture_anchor()
+            elif not was_drag:
                 self._on_click()
             event.accept()
 
@@ -616,7 +547,10 @@ class DeskPet(QWidget):
         factor = 1.08 if delta > 0 else 1 / 1.08
         self._scale = max(self._min_scale, min(self._max_scale, self._scale * factor))
         self._apply_size()
-        self._move_sprite_anchor(anchor_x, anchor_y, "center")
+        if self._follow_cursor:
+            self._sync_host()
+        else:
+            self._move_sprite_anchor(anchor_x, anchor_y, "center")
         event.accept()
 
     def _show_menu(self, global_pos: QPoint) -> None:
@@ -632,9 +566,16 @@ class DeskPet(QWidget):
             act.triggered.connect(lambda checked=False, s=scale: self._set_scale(s))
             size_menu.addAction(act)
 
-        top_act = QAction("取消置顶" if self._always_on_top else "始终置顶", self)
-        top_act.triggered.connect(self._toggle_topmost)
-        menu.addAction(top_act)
+        if self._follow_cursor:
+            follow_act = QAction("脱离 Cursor，全局置顶", self)
+        else:
+            follow_act = QAction("回到 Cursor 窗口里", self)
+        follow_act.triggered.connect(self._toggle_follow)
+        menu.addAction(follow_act)
+
+        auto_act = QAction("取消开机自启" if login_autostart_enabled() else "开机自启", self)
+        auto_act.triggered.connect(self._toggle_autostart)
+        menu.addAction(auto_act)
 
         voice_on = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         voice_act = QAction("关闭语音" if voice_on else "开启语音", self)
@@ -662,7 +603,10 @@ class DeskPet(QWidget):
         anchor_y = self.y() + layout.sprite_y + layout.sprite_h / 2
         self._scale = scale
         self._apply_size()
-        self._move_sprite_anchor(anchor_x, anchor_y, "center")
+        if self._follow_cursor:
+            self._sync_host()
+        else:
+            self._move_sprite_anchor(anchor_x, anchor_y, "center")
 
     def _toggle_bubble(self) -> None:
         """Show or hide the quota bubble without moving the character's feet."""
@@ -671,18 +615,150 @@ class DeskPet(QWidget):
         anchor_y = self.y() + layout.sprite_y + layout.sprite_h
         self._show_bubble = not self._show_bubble
         self._apply_size()
-        self._move_sprite_anchor(anchor_x, anchor_y, "bottom")
+        if self._follow_cursor:
+            self._sync_host()
+        else:
+            self._move_sprite_anchor(anchor_x, anchor_y, "bottom")
 
-    def _toggle_topmost(self) -> None:
-        self._always_on_top = not self._always_on_top
-        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-        if self._always_on_top:
+    def _apply_window_flags(self) -> None:
+        """Frameless tool window. Topmost only in the detached global mode."""
+        flags = (
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        if not self._follow_cursor:
             flags |= Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.show()
-        if self._always_on_top:
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+    def _toggle_follow(self) -> None:
+        """Switch between sticking to Cursor and the old always-on-top desktop mode."""
+        self._follow_cursor = not self._follow_cursor
+        self._host = 0
+        self._apply_window_flags()
+        self._tray.setToolTip("永雏塔菲 · 跟着 Cursor" if self._follow_cursor else "永雏塔菲 · 全局置顶")
+        if self._follow_cursor:
+            self._sync_host()
+        else:
+            self.show()
             self.raise_()
+
+    def _toggle_autostart(self) -> None:
+        """Toggle the Startup shortcut that launches the pet at login."""
+        try:
+            set_login_autostart(not login_autostart_enabled())
+        except (OSError, subprocess.SubprocessError):
+            return
+
+    def _init_tray(self) -> None:
+        """Tray icon so the pet can be quit while it is waiting for Cursor."""
+        icon = QIcon(self._pixmap_src.scaled(
+            32,
+            32,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("永雏塔菲 · 跟着 Cursor")
+        self._tray_menu = QMenu()
+        self._tray_menu.aboutToShow.connect(self._fill_tray_menu)
+        self._tray.setContextMenu(self._tray_menu)
+        self._tray.show()
+
+    def _fill_tray_menu(self) -> None:
+        """Rebuild the tray menu so the autostart label matches the shortcut."""
+        self._tray_menu.clear()
+        auto_act = QAction("取消开机自启" if login_autostart_enabled() else "开机自启", self)
+        auto_act.triggered.connect(self._toggle_autostart)
+        self._tray_menu.addAction(auto_act)
+        quit_act = QAction("退出", self)
+        quit_act.triggered.connect(QApplication.quit)
+        self._tray_menu.addAction(quit_act)
+
+    def _sync_host(self) -> None:
+        """Show the pet on the Agents window, or hide it in the IDE.
+
+        Skipped while dragging so the pointer owns the position. The pet is
+        slotted just above Cursor, so other apps still cover it.
+        """
+        if not self._follow_cursor or self._dragging:
+            return
+        pet_hwnd = int(self.winId())
+        host = find_cursor_host(prefer=self._host, exclude=pet_hwnd)
+        if host is None:
+            self._host = 0
+            if self.isVisible():
+                self.hide()
+            return
+        self._host = host.hwnd
+        if not self.isVisible():
+            self.show()
+            pet_hwnd = int(self.winId())
+        rect = window_rect(pet_hwnd)
+        if rect is None:
+            return
+        pet_w = rect[2] - rect[0]
+        pet_h = rect[3] - rect[1]
+        x, y = self._anchor_xy(host.left, host.top, host.right, host.bottom, pet_w, pet_h)
+        place_above(pet_hwnd, host.hwnd, x, y)
+
+    def _anchor_xy(
+        self,
+        left: int,
+        top: int,
+        right: int,
+        bottom: int,
+        pet_w: int,
+        pet_h: int,
+    ) -> tuple[int, int]:
+        """Physical top-left that keeps the saved gap from the locked corner."""
+        if self._anchor_corner == "bl":
+            x = left + self._anchor_mx
+            y = bottom - self._anchor_my - pet_h
+        elif self._anchor_corner == "tr":
+            x = right - self._anchor_mx - pet_w
+            y = top + self._anchor_my
+        elif self._anchor_corner == "tl":
+            x = left + self._anchor_mx
+            y = top + self._anchor_my
+        else:
+            x = right - self._anchor_mx - pet_w
+            y = bottom - self._anchor_my - pet_h
+        max_x = right - pet_w
+        max_y = bottom - pet_h
+        if max_x < left:
+            x = left
+        else:
+            x = min(max(x, left), max_x)
+        if max_y < top:
+            y = top
+        else:
+            y = min(max(y, top), max_y)
+        return x, y
+
+    def _capture_anchor(self) -> None:
+        """Remember which corner the pet was dropped nearest, and the gap."""
+        if not self._host:
+            return
+        host = window_rect(self._host)
+        pet = window_rect(int(self.winId()))
+        if host is None or pet is None:
+            return
+        left, top, right, bottom = host
+        pet_left, pet_top, pet_right, pet_bottom = pet
+        gaps = {
+            "tl": (pet_left - left, pet_top - top),
+            "tr": (right - pet_right, pet_top - top),
+            "bl": (pet_left - left, bottom - pet_bottom),
+            "br": (right - pet_right, bottom - pet_bottom),
+        }
+        corner = min(gaps, key=lambda name: abs(gaps[name][0]) + abs(gaps[name][1]))
+        mx, my = gaps[corner]
+        self._anchor_corner = corner
+        self._anchor_mx = max(0, mx)
+        self._anchor_my = max(0, my)
 
     def _init_voice(self) -> None:
         """Load the mp3 and loop it for the lifetime of the pet."""
@@ -767,17 +843,10 @@ class DeskPet(QWidget):
         self._sync_mood(result.snapshot)
 
     def _set_roll_targets(self, snapshot: QuotaSnapshot) -> None:
-        """Roll the remaining dollars. Percents snap on first sight, then ease when they change."""
-        remain = None if snapshot.remaining_cents is None else snapshot.remaining_cents / 100.0
-        self._roll_target["remain"] = remain
-        if remain is None:
-            self._roll["remain"] = None
-        elif self._roll["remain"] is None:
-            self._roll["remain"] = 0.0
+        """Snap a pool the first time it appears, then ease it when it changes."""
         for key, value in (
             ("auto", snapshot.auto_percent),
             ("api", snapshot.api_percent),
-            ("plan", plan_used_percent(snapshot)),
         ):
             self._roll_target[key] = value
             if value is None or self._roll[key] is None:
@@ -788,7 +857,7 @@ class DeskPet(QWidget):
         alert = alert_percent(snapshot)
         level = mood_level(alert)
         tier = alert_tier(alert)
-        if alert is None and snapshot.remaining_cents is None:
+        if alert is None:
             self._line = snapshot.missing_note or "接口没带回额度"
             self._level = -1
             self._tier = 0
@@ -816,9 +885,9 @@ def main() -> None:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(True)
+    app.setQuitOnLastWindowClosed(False)
     pet = DeskPet()
-    pet.show()
+    pet._sync_host()
     sys.exit(app.exec())
 
 

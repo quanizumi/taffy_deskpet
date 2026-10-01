@@ -72,13 +72,26 @@ def plan_used_percent(snapshot: QuotaSnapshot) -> float | None:
     return spent / limit * 100.0
 
 
+def displayed_percent(value: float) -> int:
+    """Whole percent shown on Cursor's usage page.
+
+    Half-up, matching that page: 5.44 is 5, 0.62 is 1. The raw percent stays
+    on the bar; only the label is rounded.
+    """
+
+    if value < 0:
+        return int(value - 0.5)
+    return int(value + 0.5)
+
+
 def alert_percent(snapshot: QuotaSnapshot) -> float | None:
-    """Highest of plan spend, Auto, and API. None when none of them exist."""
+    """Highest of the two usage-page pools. None when neither exists.
+
+    Cursor Models is autoPercentUsed. Other Models is apiPercentUsed.
+    includedSpend / limit is a different dollar cap and is not part of this.
+    """
 
     values: list[float] = []
-    plan = plan_used_percent(snapshot)
-    if plan is not None:
-        values.append(plan)
     if snapshot.auto_percent is not None:
         values.append(snapshot.auto_percent)
     if snapshot.api_percent is not None:
@@ -117,6 +130,8 @@ def parse_period_usage(payload: dict) -> QuotaSnapshot:
 
     Accepts only the types observed on the wire. A bool is not treated as a
     number. A float cent value is ignored rather than rounded into an int.
+    autoPercentUsed and apiPercentUsed are the usage-page pools (Cursor Models
+    and Other Models). They are not includedSpend / limit.
     """
 
     plan = payload.get("planUsage")
@@ -131,9 +146,9 @@ def parse_period_usage(payload: dict) -> QuotaSnapshot:
 
     missing: list[str] = []
     if auto is None:
-        missing.append("Auto")
+        missing.append("Cursor")
     if api is None:
-        missing.append("API")
+        missing.append("其他")
     note = "、".join(missing) + " 分项没返回" if missing else None
     return QuotaSnapshot(auto, api, spent, limit, remaining, note)
 
@@ -362,6 +377,28 @@ def _self_check() -> None:
     assert mood_level(alert_percent(snap)) == 0
     assert alert_tier(alert_percent(snap)) == 0
 
+    # Dollar cap can read 100% while the usage page still shows single digits.
+    pools = parse_period_usage(
+        {
+            "planUsage": {
+                "totalSpend": 2462,
+                "includedSpend": 2000,
+                "bonusSpend": 462,
+                "limit": 2000,
+                "autoPercentUsed": 5.44,
+                "apiPercentUsed": 0.62,
+                "totalPercentUsed": 5.21,
+            }
+        }
+    )
+    assert pools.remaining_cents is None
+    assert pools.auto_percent == 5.44
+    assert pools.api_percent == 0.62
+    assert plan_used_percent(pools) == 100.0
+    assert displayed_percent(pools.auto_percent or 0) == 5
+    assert displayed_percent(pools.api_percent or 0) == 1
+    assert mood_level(alert_percent(pools)) == 0
+
     assert parse_period_usage({}).missing_note == _NO_POOLS
     bad = parse_period_usage(
         {"planUsage": {"autoPercentUsed": True, "includedSpend": 1.5, "limit": 2000}}
@@ -369,7 +406,7 @@ def _self_check() -> None:
     assert bad.auto_percent is None
     assert bad.included_spend_cents is None
     assert bad.limit_cents == 2000
-    assert bad.missing_note is not None and "Auto" in bad.missing_note
+    assert bad.missing_note is not None and "Cursor" in bad.missing_note
 
     assert mood_level(49.9) == 0
     assert mood_level(50) == 1
